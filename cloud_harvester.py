@@ -161,6 +161,28 @@ class CloudHarvester:
 
         try:
             # ============================================================
+            # 0. 检测资源耗尽弹窗 (Resource Exhausted)
+            # ============================================================
+            try:
+                # 检测常见的错误弹窗容器
+                dialog_selector = 'div[role="dialog"]'
+                if await self.page.is_visible(dialog_selector):
+                    dialog_text = await self.page.inner_text(dialog_selector)
+                    # 关键词匹配 (兼顾中英文)
+                    exhausted_keywords = [
+                        "Resources exhausted", "资源用尽", "资源耗尽",
+                        "Quota exceeded", "配额已满", "Capacity reached",
+                        "Something went wrong", "出错了" # 宽泛的错误也刷新重试
+                    ]
+                    
+                    if any(k in dialog_text for k in exhausted_keywords):
+                        print(f"⚠️ Cloud Harvester: Error dialog detected ('{dialog_text[:30]}...'). Marking for refresh.")
+                        self.refresh_needed = True
+                        return
+            except Exception as e:
+                print(f"   - Resource check failed: {e}")
+
+            # ============================================================
             # 1. 处理条款弹窗 (修复了 SyntaxError)
             # 使用原生 JS 遍历元素，替代不兼容的 Selector
             # ============================================================
