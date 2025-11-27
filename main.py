@@ -218,8 +218,6 @@ class VertexAIClient:
         
         # Combine reasoning and content if reasoning exists
         final_content = full_content
-        if reasoning_content:
-            final_content = f"<think>\n{reasoning_content}\n</think>\n\n{full_content}"
         
         # Workaround for clients that treat empty content as failure
         if not final_content:
@@ -240,7 +238,8 @@ class VertexAIClient:
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": final_content
+                        "content": final_content,
+                        "reasoning_content": reasoning_content
                     },
                     "finish_reason": finish_reason
                 }
@@ -293,6 +292,14 @@ class VertexAIClient:
         max_retries = 1
         content_yielded = False # Track if any content chunk was yielded
         
+        # Initialize state for Gemini 3 Pro thinking parsing
+        parse_state = {
+            "buffer": "",
+            "in_thought": False,
+            "finished_thinking": False,
+            "first_chunk": True
+        }
+
         for attempt in range(max_retries + 1):
             
             creds = cred_manager.get_credentials()
@@ -425,6 +432,19 @@ class VertexAIClient:
                     "thinkingBudget": budget
                 }
                 print(f"ℹ️ Configured Thinking (Custom): Budget={budget}")
+
+            # Case 3: Gemini 3 Pro (or similar) without specific suffix/max_tokens, but we want to enable thoughts.
+            # Ensure includeThoughts is True for supported models as requested.
+            elif 'gemini-3-pro' in target_model:
+                 # Default to a reasonable budget if not specified, or just enable it.
+                 # Using 8192 as a safe default for "low" equivalent.
+                 budget = 8192
+                 gen_config['thinkingConfig'] = {
+                    "includeThoughts": True,
+                    "budget_token_count": budget,
+                    "thinkingBudget": budget
+                 }
+                 print(f"ℹ️ Configured Thinking (Auto-Enable): Budget={budget}")
             
             # Handle Resolution (Image Generation)
             if resolution_mode:
@@ -625,7 +645,7 @@ class VertexAIClient:
                                 decoder = json.JSONDecoder()
                                 obj, idx = decoder.raw_decode(buffer)
                                 
-                                for chunk_data in self.process_google_response(obj):
+                                for chunk_data in self.process_google_response(obj, model, parse_state):
                                     yield chunk_data
                                     content_yielded = True # Mark that content was successfully yielded
                                 
@@ -712,18 +732,24 @@ class VertexAIClient:
             # If the stream finished but yielded no content, log a warning.
             # We rely on the client to handle the empty stream gracefully after receiving [DONE].
             print("⚠️ Proxy Warning: Google API returned an empty stream (200 OK but no content).")
-            
+        
+        # Flush remaining buffer from parse_state
+        if parse_state['buffer']:
+            # If buffer is not empty, it means we were waiting for delimiter and didn't find it.
+            # So it's all reasoning.
+            yield f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4()}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'vertex-ai-proxy', 'choices': [{'index': 0, 'delta': {'reasoning_content': parse_state['buffer']}, 'finish_reason': None}]})}\n\n"
+
         # Ensure the stream is properly terminated with [DONE]
         yield "data: [DONE]\n\n"
 
-    def process_google_response(self, data: Dict[str, Any]) -> Generator[str, None, None]:
+    def process_google_response(self, data: Dict[str, Any], model: str = "", state: Dict[str, Any] = None) -> Generator[str, None, None]:
             """Converts Google's response format to OpenAI's SSE format, handling text and images."""
             try:
                 if not data:
                     return
                 
                 # Debug: Log the raw data received from Google
-                print(f"🔍 Google Raw Chunk: {json.dumps(data, indent=2)[:500]}...")
+                # print(f"🔍 Google Raw Chunk: {json.dumps(data, indent=2)[:500]}...")
     
                 if 'error' in data:
                     print(f"⚠️ Google Stream Error: {data['error']}")
@@ -754,12 +780,25 @@ class VertexAIClient:
     
                             for part in parts:
                                 delta = {}
-                                # --- Text Part ---
-                                text = part.get('text', '')
-                                if text:
-                                    if part.get('thought', False):
-                                        delta['reasoning_content'] = text
-                                    else:
+                                
+                                # --- Handle Thought/Reasoning ---
+                                # Check for explicit thought field (new API behavior)
+                                is_thought = False
+                                thought_content = ""
+                                
+                                if 'thought' in part and part['thought']:
+                                    is_thought = True
+                                    if isinstance(part['thought'], str):
+                                        thought_content = part['thought']
+                                    elif part['thought'] is True and 'text' in part:
+                                        thought_content = part['text']
+                                
+                                if is_thought:
+                                    delta['reasoning_content'] = thought_content
+                                else:
+                                    # --- Text Part ---
+                                    text = part.get('text', '')
+                                    if text:
                                         delta['content'] = text
     
                                 # --- Image Part (inline data) ---
